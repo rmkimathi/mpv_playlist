@@ -2,7 +2,7 @@
 
 ![Options](mpv_playlist.png)
 
-**Setup and packaging**
+## Setup and packaging
 
 MPV Playlist uses PySide6 for its interface. Install dependencies in a virtual environment, then launch the app:
 
@@ -44,7 +44,7 @@ python mpv_playlist.py
 pyinstaller --noconsole --icon=mpvl.ico --add-data="mpvl.ico;." mpv_playlist.py
 ```
 
-**What it does**
+## What it does
 
 - **Player controls:** play/pause, stop, previous/next, a seek bar, volume, mute, speed, fullscreen, subtitle and audio-track cycling, and screenshot. It starts its own mpv window and still loads your `mpv.conf`, so `hwdec=vaapi`, your geometry and your subtitle font apply as usual.
 - **Playlist tab:**
@@ -56,16 +56,14 @@ pyinstaller --noconsole --icon=mpvl.ico --add-data="mpvl.ico;." mpv_playlist.py
   - “Apply” pushes them to the running mpv.
   - “Save” rewrites only the global section above your first `[profile]` and keeps a backup as `mpv.conf.bak`. Your `[music]` and `[movie]` profiles are untouched.
 
-**Things to know**
+## Things to know
 
 - Geometry only takes effect when mpv starts, and `hwdec` applies from the next file loaded.
 - EQ gains and volume are remembered in `./state.json`.
 - If you close the mpv window, the frontend restarts it and restores the playlist the next time you use a control.
 - Your `[music]` profile uses `profile-cond`. If mpv’s profile switching also adds its own EQ filters, you’d hear both. Turn the frontend equalizer off if the sound is boosted twice.
 
-
-
-**Windows support**
+## Windows support
 
 - **Connection to mpv:** the Linux version used a unix socket, which mpv doesn’t offer on Windows. It now connects over a named pipe on Windows and keeps the socket on Linux. The Windows reader only reads when data is waiting, so a pending read can’t block commands you send from the GUI.
 - **Finding mpv:** it looks for `mpv.exe` next to the script first, then on `PATH`, then in the usual Scoop and Program Files folders. If none is found, you get a clear message instead of a crash.
@@ -77,7 +75,7 @@ pyinstaller --noconsole --icon=mpvl.ico --add-data="mpvl.ico;." mpv_playlist.py
   - Reading `mpv.conf` now tolerates a byte-order mark from Windows editors.
 - **Look on Windows:** fonts switch to Segoe UI and Consolas, and the app asks Windows for sharp text on high-DPI screens. Single-letter drive paths like `C:/x` are no longer mistaken for URLs.
 
-**state.json**  
+**state.json**
 It is saved as `state.json` in the same folder as the script (or the `.exe` if you package it). The load and save code no longer creates any folders. If you put the script somewhere read-only, such as Program Files, saving fails silently and the equalizer and volume aren’t remembered.
 
 **On Windows**
@@ -87,7 +85,7 @@ It is saved as `state.json` in the same folder as the script (or the `.exe` if y
 
 
 
-**Features**
+## Features
 
 - **Browse file picker:** it uses the native Open, Save and Folder dialogs. Add files supports multi-select and has a media filter, and the dialogs remember the last folder you used. Add URL is pre-filled if your clipboard holds a link, and the subtitle font is a drop-down of installed fonts.
 - **Drag and drop:**
@@ -99,7 +97,7 @@ It is saved as `state.json` in the same folder as the script (or the `.exe` if y
   - **On selected entries:** Play, Remove, Move (up, down, top, bottom), Show in folder, and Copy path or URL.
   - **Always shown:** the add options, Paste, Select all, Shuffle and Clear.
 
-**Other Features**
+## Other Features
 
 - **Keyboard shortcuts:** Ctrl+O, Ctrl+Shift+O, Ctrl+U, Ctrl+V, Enter and Delete.
 - **Seek bar:** you can click anywhere on it to jump there.
