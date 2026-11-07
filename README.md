@@ -76,6 +76,7 @@ pyinstaller --noconsole --icon=mpvl.ico --add-data="mpvl.ico;." mpv_playlist.py
 - **Look on Windows:** fonts switch to Segoe UI and Consolas, and the app asks Windows for sharp text on high-DPI screens. Single-letter drive paths like `C:/x` are no longer mistaken for URLs.
 
 **state.json**
+
 It is saved as `state.json` in the same folder as the script (or the `.exe` if you package it). The load and save code no longer creates any folders. If you put the script somewhere read-only, such as Program Files, saving fails silently and the equalizer and volume aren’t remembered.
 
 **On Windows**
