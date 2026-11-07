@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Name=MPV Playlist
+Comment=MPV Playlist is a GUI for mpv
+Exec=/home/kimathi/.local/mpv_playlist/mpv_playlist
+Path=/home/kimathi/.local/mpv_playlist/
+Icon=mpvl
+Terminal=false
+Type=Application
+Categories=AudioVideo;AudioVideoEditing;
+StartupWMClass=MPV Playlist
