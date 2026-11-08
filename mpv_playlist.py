@@ -37,10 +37,18 @@ How it works
   still loaded by mpv as usual; the GUI only overrides things at runtime when you ask.
   The app's own state (equalizer, volume, window size, last folder) is saved in
   state.json next to this script.
+
+Troubleshooting
+  Set the environment variable MPV_PL_DEBUG=1 before starting (PowerShell:
+  $env:MPV_PL_DEBUG=1; python mpv_playlist_qt.py). If the window ever stops
+  responding for 5 seconds, every thread's stack is written to debug.log next to
+  this script - send that file along when reporting a freeze.
 """
 
+import faulthandler
 import json
 import os
+import queue
 import re
 import shutil
 import socket
@@ -51,7 +59,7 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QItemSelectionModel, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QByteArray, QItemSelectionModel, QObject, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import (QAction, QDesktopServices, QFont, QGuiApplication, QIcon,
                            QKeySequence, QPainter, QPalette, QPen)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
@@ -67,14 +75,8 @@ IS_WINDOWS = sys.platform == "win32"
 
 # Folder of this script (or of the .exe when frozen with PyInstaller).
 APP_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
-#APP_STATE = APP_DIR / "state.json"
-#APP_ICON = APP_DIR / "mpvl.ico"
-
-IS_FROZEN = getattr(sys, "frozen", False)
-EXE_DIR = Path(sys.executable if IS_FROZEN else __file__).resolve().parent
-ASSET_DIR = Path(sys._MEIPASS).resolve() if IS_FROZEN else Path(__file__).resolve().parent
-APP_STATE = EXE_DIR / "state.json"
-APP_ICON = ASSET_DIR / "mpvl.ico"
+APP_STATE = APP_DIR / "state.json"
+APP_ICON = APP_DIR / "_internal" / "assets" / "mpvl.ico"
 
 FONT_MONO = "Consolas" if IS_WINDOWS else "DejaVu Sans Mono"
 INSTALL_HINT = ("install mpv and add it to PATH, or put mpv.exe next to this script"
@@ -165,18 +167,95 @@ HWDEC_CHOICES = (["no", "auto", "auto-safe", "d3d11va", "d3d11va-copy", "dxva2",
 # --------------------------------------------------------------------------- #
 if IS_WINDOWS:
     import ctypes
-    import msvcrt
     from ctypes import wintypes
 
-    _PeekNamedPipe = ctypes.WinDLL("kernel32", use_last_error=True).PeekNamedPipe
-    _PeekNamedPipe.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
-                               wintypes.LPDWORD, wintypes.LPDWORD, wintypes.LPDWORD]
-    _PeekNamedPipe.restype = wintypes.BOOL
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _INVALID_HANDLE = ctypes.c_void_p(-1).value
+    _ERROR_IO_PENDING = 997
+
+    class _OVERLAPPED(ctypes.Structure):
+        _fields_ = [("Internal", ctypes.c_void_p), ("InternalHigh", ctypes.c_void_p),
+                    ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD),
+                    ("hEvent", ctypes.c_void_p)]
+
+    _k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                 wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+    _k32.CreateFileW.restype = ctypes.c_void_p
+    _k32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+    _k32.CreateEventW.restype = ctypes.c_void_p
+    for _fn in (_k32.ReadFile, _k32.WriteFile):
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+                        ctypes.POINTER(_OVERLAPPED)]
+        _fn.restype = wintypes.BOOL
+    _k32.GetOverlappedResult.argtypes = [ctypes.c_void_p, ctypes.POINTER(_OVERLAPPED),
+                                         ctypes.POINTER(wintypes.DWORD), wintypes.BOOL]
+    _k32.GetOverlappedResult.restype = wintypes.BOOL
+    _k32.CancelIoEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    _k32.CancelIoEx.restype = wintypes.BOOL
+    _k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    _k32.CloseHandle.restype = wintypes.BOOL
+
+    class WinPipe:
+        """Client end of mpv's named pipe with the same recv/sendall/close interface as a
+        socket. It uses overlapped I/O: a plain (synchronous) pipe handle makes a pending
+        read and a write take turns, which deadlocks against mpv as soon as both pipe
+        buffers fill up (e.g. while adding a folder). Here one thread can sit in a read
+        while another writes."""
+
+        def __init__(self, path):
+            # GENERIC_READ|GENERIC_WRITE, no sharing, OPEN_EXISTING, FILE_FLAG_OVERLAPPED
+            h = _k32.CreateFileW(path, 0xC0000000, 0, None, 3, 0x40000000, None)
+            if h is None or h == _INVALID_HANDLE:
+                raise ctypes.WinError(ctypes.get_last_error())
+            self.h = h
+            self._rev = _k32.CreateEventW(None, True, False, None)    # used by the reader thread
+            self._wev = _k32.CreateEventW(None, True, False, None)    # used by the writer thread
+            self.closed = False
+
+        def _finish(self, ok, ov):
+            """Wait for an overlapped call to complete; returns the byte count."""
+            if not ok and ctypes.get_last_error() != _ERROR_IO_PENDING:
+                raise ctypes.WinError(ctypes.get_last_error())
+            n = wintypes.DWORD(0)
+            if not _k32.GetOverlappedResult(self.h, ctypes.byref(ov), ctypes.byref(n), True):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return n.value
+
+        def recv(self, size=65536):
+            """Blocks until mpv sends something; raises OSError when the pipe is closed."""
+            if self.closed:
+                raise OSError("pipe closed")
+            ov = _OVERLAPPED()
+            ov.hEvent = self._rev
+            buf = ctypes.create_string_buffer(size)
+            ok = _k32.ReadFile(self.h, buf, size, None, ctypes.byref(ov))
+            count = self._finish(ok, ov)            # the buffer is only filled after this returns
+            return buf.raw[:count]
+
+        def sendall(self, data):
+            view = memoryview(data)
+            while len(view):
+                if self.closed:
+                    raise OSError("pipe closed")
+                chunk = bytes(view[:65536])
+                ov = _OVERLAPPED()
+                ov.hEvent = self._wev
+                ok = _k32.WriteFile(self.h, chunk, len(chunk), None, ctypes.byref(ov))
+                view = view[self._finish(ok, ov):]
+
+        def close(self):
+            if self.closed:
+                return
+            self.closed = True
+            _k32.CancelIoEx(self.h, None)           # wakes a reader that is waiting in recv()
+            for handle in (self.h, self._rev, self._wev):
+                _k32.CloseHandle(handle)
 
 
 class MpvIPC:
     OBSERVED = ["time-pos", "duration", "pause", "volume", "mute", "speed",
                 "media-title", "playlist", "idle-active"]
+    PLAYLIST_ID = 100 + OBSERVED.index("playlist") + 1     # id used in observe_property
 
     def __init__(self):
         if IS_WINDOWS:
@@ -191,6 +270,8 @@ class MpvIPC:
         self._lock = threading.Lock()
         self._req = 0
         self._pending = {}
+        self._outbox = None
+        self.error = ""                 # last connection error, shown in the status bar
 
     # -- lifecycle --------------------------------------------------------- #
     def alive(self):
@@ -200,7 +281,7 @@ class MpvIPC:
         """One attempt to connect to mpv's IPC endpoint; returns a connection or None."""
         if IS_WINDOWS:
             try:
-                return open(self.ipc_path, "r+b", buffering=0)
+                return WinPipe(self.ipc_path)
             except OSError:
                 return None
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -216,6 +297,9 @@ class MpvIPC:
             raise RuntimeError(f"mpv was not found ({INSTALL_HINT})")
         self._cleanup_socket()
         self.state = {}
+        self.error = ""
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.kill()            # connection was lost but mpv still runs: don't leave a second window
         self.proc = subprocess.Popen(
             [MPV_EXE, "--idle=yes", "--force-window=yes", "--no-terminal",
              f"--input-ipc-server={self.ipc_path}"],
@@ -235,7 +319,9 @@ class MpvIPC:
             raise RuntimeError("Could not connect to mpv's IPC endpoint")
         self.conn = conn
         self._alive = True
+        self._outbox = queue.Queue()
         threading.Thread(target=self._reader, args=(conn,), daemon=True).start()
+        threading.Thread(target=self._writer, args=(conn, self._outbox), daemon=True).start()
         for i, name in enumerate(self.OBSERVED, 1):
             self.command("observe_property", 100 + i, name)
 
@@ -249,6 +335,8 @@ class MpvIPC:
                 self.proc.kill()
             except Exception:
                 pass
+        if self._outbox is not None:
+            self._outbox.put(None)              # stops the writer thread
         self._alive = False
         conn, self.conn = self.conn, None
         try:
@@ -267,27 +355,37 @@ class MpvIPC:
             pass
 
     # -- IO ---------------------------------------------------------------- #
-    def _recv(self, conn):
+    @staticmethod
+    def _recv(conn):
         """Wait for data from mpv. Returns b"" when the connection is gone."""
-        if not IS_WINDOWS:
-            return conn.recv(65536)
-        # A blocking read on a synchronous Windows pipe handle would also block writes
-        # from other threads, so only read once PeekNamedPipe reports waiting data.
-        handle = msvcrt.get_osfhandle(conn.fileno())
-        avail = wintypes.DWORD(0)
-        while conn is self.conn:
-            if not _PeekNamedPipe(handle, None, 0, None, ctypes.byref(avail), None):
-                return b""
-            if avail.value:
-                return conn.read(avail.value)
-            time.sleep(0.02)
-        return b""
+        return conn.recv(65536)
 
-    def _send(self, data):
-        if IS_WINDOWS:
-            self.conn.write(data)
-        else:
-            self.conn.sendall(data)
+    @staticmethod
+    def _send(conn, data):
+        conn.sendall(data)
+
+    def _writer(self, conn, outbox):
+        """Sends queued commands to mpv. This is the only place that writes to the pipe,
+        so a busy mpv (or a full pipe on Windows) never blocks the GUI thread."""
+        try:
+            while True:
+                chunks = [outbox.get()]
+                while len(chunks) < 256:        # batch whatever is already waiting
+                    try:
+                        chunks.append(outbox.get_nowait())
+                    except queue.Empty:
+                        break
+                data = b"".join(c for c in chunks if c is not None)
+                if data and conn is self.conn:
+                    self._send(conn, data)
+                if None in chunks or conn is not self.conn:
+                    break
+        except (OSError, ValueError) as e:
+            if conn is self.conn:
+                self.error = f"write: {e}"
+        finally:
+            if conn is self.conn:
+                self._alive = False
 
     def _reader(self, conn):
         buf = b""
@@ -306,8 +404,9 @@ class MpvIPC:
                     except ValueError:
                         continue
                     self._dispatch(msg)
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError) as e:
+            if conn is self.conn:
+                self.error = f"read: {e}"
         finally:
             if conn is self.conn:
                 self._alive = False
@@ -322,20 +421,15 @@ class MpvIPC:
             self.state[msg.get("name")] = msg.get("data")
 
     def command(self, *args, wait=False, timeout=2.0):
-        if self.conn is None:
+        """Queue a command for mpv and return immediately (wait=True waits for the reply)."""
+        if self.conn is None or self._outbox is None:
             return None
         with self._lock:
             self._req += 1
             rid = self._req
             if wait:
                 self._pending[rid] = [threading.Event(), None]
-            payload = json.dumps({"command": list(args), "request_id": rid}) + "\n"
-            try:
-                self._send(payload.encode())
-            except (OSError, ValueError, AttributeError):
-                self._alive = False
-                self._pending.pop(rid, None)
-                return None
+        self._outbox.put((json.dumps({"command": list(args), "request_id": rid}) + "\n").encode())
         if wait:
             slot = self._pending[rid]
             slot[0].wait(timeout)
@@ -468,30 +562,68 @@ def read_m3u(path):
     return entries
 
 
-def scan_folder(folder, recursive=False):
-    """Media files in a folder, naturally sorted (10 after 9), optionally with subfolders."""
+SKIP_DIRS = {"$recycle.bin", "system volume information"}
+MAX_DEPTH = 25
+
+
+def _is_reparse(entry):
+    """Symlinks and Windows junctions: not followed while recursing, they can loop forever."""
+    try:
+        if entry.is_symlink():
+            return True
+        return bool(getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0) & 0x400)
+    except OSError:
+        return True
+
+
+def scan_folder(folder, recursive=False, stop=None, progress=None, offset=0):
+    """Media files in a folder, naturally sorted (10 after 9), optionally with subfolders.
+    Uses os.scandir (no extra stat call per file, which is what makes Windows slow).
+    `stop()` aborts the scan, `progress(n)` is called now and then with the running count."""
     found = []
-    if recursive:
-        for root, dirs, files in os.walk(folder):
-            dirs.sort(key=natural_key)
-            found += [os.path.join(root, f) for f in sorted(files, key=natural_key)
-                      if Path(f).suffix.lower() in MEDIA_EXT]
-    else:
-        found = [os.path.join(folder, f) for f in sorted(os.listdir(folder), key=natural_key)
-                 if Path(f).suffix.lower() in MEDIA_EXT and os.path.isfile(os.path.join(folder, f))]
+
+    def walk(path, depth):
+        try:
+            with os.scandir(path) as it:
+                entries = sorted(it, key=lambda e: natural_key(e.name))
+        except OSError:
+            return                                  # unreadable folder: skip it
+        subdirs = []
+        for e in entries:
+            if stop and stop():
+                return
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if (recursive and depth < MAX_DEPTH and e.name.lower() not in SKIP_DIRS
+                            and not _is_reparse(e)):
+                        subdirs.append(e.path)
+                elif os.path.splitext(e.name)[1].lower() in MEDIA_EXT and e.is_file():
+                    found.append(e.path)
+                    if progress and len(found) % 200 == 0:
+                        progress(offset + len(found))
+            except OSError:
+                continue
+        for sub in subdirs:                         # files first, then subfolders
+            if stop and stop():
+                return
+            walk(sub, depth + 1)
+
+    walk(folder, 0)
     return found
 
 
-def expand_inputs(paths, recursive=True):
+def expand_inputs(paths, recursive=True, stop=None, progress=None):
     """Turn dropped/pasted paths into (media entries, subtitle files):
     folders are scanned, .m3u playlists are read, URLs pass through."""
     media, subs = [], []
     for p in paths:
+        if stop and stop():
+            break
         ext = Path(p).suffix.lower()
         if is_url(p):
             media.append(p)
         elif os.path.isdir(p):
-            media += scan_folder(p, recursive)
+            media += scan_folder(p, recursive, stop, progress, offset=len(media))
         elif not os.path.exists(p):
             continue
         elif ext in PLAYLIST_EXT:
@@ -742,6 +874,34 @@ class PlaylistWidget(QListWidget):
             super().keyPressEvent(event)
 
 
+class ScanJob(QObject):
+    """Expands dropped/chosen paths (folders, playlists) on a background thread, so
+    slow disks, network shares or antivirus scanning can never freeze the window - and
+    never keep Explorer waiting inside a drop."""
+
+    progress = Signal(int)
+    done = Signal(list, list, int)      # media, subtitles, row to insert before
+
+    def __init__(self, paths, recursive, row):
+        super().__init__()
+        self.paths, self.recursive, self.row = paths, recursive, row
+        self.stop = threading.Event()
+        self.finished = False
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            media, subs = expand_inputs(self.paths, self.recursive, self.stop.is_set,
+                                        self.progress.emit)
+        except Exception:
+            media, subs = [], []
+        self.finished = True
+        if not self.stop.is_set():
+            self.done.emit(media, subs, self.row)
+
+
 # --------------------------------------------------------------------------- #
 # Main window
 # --------------------------------------------------------------------------- #
@@ -764,6 +924,10 @@ class MainWindow(QMainWindow):
         self.current_index = None
         self.vol_touch = 0.0
         self.dead_notified = False
+        self.jobs = []                           # running background folder scans
+        self.watchdog = None
+        if os.environ.get("MPV_PL_DEBUG"):       # opt-in: dump every thread's stack if the GUI stalls
+            self.watchdog = open(APP_DIR / "debug.log", "w", buffering=1)
 
         self.eq_timer = QTimer(self)             # debounce: apply EQ shortly after the last change
         self.eq_timer.setSingleShot(True)
@@ -1201,9 +1365,7 @@ class MainWindow(QMainWindow):
 
     # -- playlist: adding ---------------------------------------------------------------- #
     def add_paths(self, paths):
-        for p in paths:
-            if p:
-                self.cmd("loadfile", p, "append-play")
+        self.add_media([p for p in paths if p], [])
 
     def add_files_dialog(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Add files", self.last_dir, MEDIA_FILTER)
@@ -1215,11 +1377,8 @@ class MainWindow(QMainWindow):
     def add_folder_dialog(self, recursive):
         d = QFileDialog.getExistingDirectory(self, "Add folder", self.last_dir)
         if d:
-            d = os.path.normpath(d)
-            self.last_dir = d
-            files = scan_folder(d, recursive)
-            self.add_paths(files)
-            self.status(f"Added {len(files)} files")
+            self.last_dir = os.path.normpath(d)
+            self.handle_drop([self.last_dir], -1, recursive)
 
     def add_url_dialog(self):
         clip = QGuiApplication.clipboard().text().strip()
@@ -1235,32 +1394,57 @@ class MainWindow(QMainWindow):
         else:
             self.status("The clipboard has no usable file paths or URLs")
 
-    def handle_drop(self, paths, row=-1):
-        """Add dropped/pasted paths; with row >= 0 they are placed before that row."""
-        media, subs = expand_inputs(paths)
+    def handle_drop(self, paths, row=-1, recursive=True):
+        """Add dropped/pasted/chosen paths; with row >= 0 they are placed before that row.
+        Folders and playlists are expanded on a background thread; this returns at once."""
+        if not paths:
+            return
+        job = ScanJob(paths, recursive, row)
+        job.progress.connect(self.on_scan_progress)
+        job.done.connect(self.on_scan_done)
+        self.jobs.append(job)
+        self.status("Scanning…")
+        job.start()
+
+    @Slot(int)
+    def on_scan_progress(self, count):
+        self.status(f"Scanning… {count} files found")
+
+    @Slot(list, list, int)
+    def on_scan_done(self, media, subs, row):
+        self.jobs = [j for j in self.jobs if not j.finished]
+        self.add_media(media, subs, row)
+
+    def add_media(self, media, subs, row=-1):
+        """Send entries to mpv (before `row` if given). Runs on the GUI thread but only
+        queues commands, so it stays instant even for thousands of files."""
         if media and self.ensure_mpv():
             before = len(self.last_playlist)
-            self.add_paths(media)
+            bulk = len(media) > 20
+            if bulk:    # mpv re-sends the whole playlist after every single append: pause that
+                self.mpv.command("unobserve_property", self.mpv.PLAYLIST_ID)
+            for p in media:
+                self.mpv.command("loadfile", p, "append-play")
             if 0 <= row < before:
                 cmds, _ = plan_moves(before + len(media), range(before, before + len(media)), row)
                 for i, j in cmds:
-                    self.cmd("playlist-move", i, j)
+                    self.mpv.command("playlist-move", i, j)
+            if bulk:    # one fresh playlist update with everything in it
+                self.mpv.command("observe_property", self.mpv.PLAYLIST_ID, "playlist")
         for s in subs:
             self.cmd("sub-add", s, "select")
         if media or subs:
             parts = ([f"{len(media)} items"] if media else []) + ([f"{len(subs)} subtitles"] if subs else [])
             self.status("Added " + " and ".join(parts))
         else:
-            self.status("Nothing playable in what was dropped")
+            self.status("Nothing playable found")
 
     def load_m3u(self):
         path, _ = QFileDialog.getOpenFileName(self, "Load playlist", self.last_dir,
                                               "Playlists (*.m3u *.m3u8);;All files (*)")
         if path:
             self.last_dir = os.path.dirname(path)
-            entries = read_m3u(path)
-            self.add_paths(entries)
-            self.status(f"Loaded {len(entries)} entries")
+            self.handle_drop([path], -1)
 
     def save_m3u(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save playlist",
@@ -1320,7 +1504,11 @@ class MainWindow(QMainWindow):
 
     def reveal(self, path):
         if IS_WINDOWS:
-            subprocess.Popen(["explorer", f"/select,{os.path.normpath(path)}"])
+            # Explorer only understands /select,"path" with the quotes around the path alone.
+            # Passing a list would make Python quote the whole "/select,path" token for paths
+            # with spaces, and Explorer then falls back to opening Documents. A plain string
+            # is handed to Windows unchanged. (It also needs backslashes, hence normpath.)
+            subprocess.Popen(f'explorer /select,"{os.path.normpath(path)}"')
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
 
@@ -1427,10 +1615,14 @@ class MainWindow(QMainWindow):
         self.current_index = current_index
 
     def refresh_ui(self):
+        if self.watchdog:       # re-armed on every tick; fires only if the GUI stops ticking for 5 s
+            faulthandler.dump_traceback_later(5, file=self.watchdog)
         if not self.mpv.alive():
             if not self.dead_notified and self.mpv.proc is not None:
                 self.dead_notified = True
-                self.status("mpv was closed - it restarts when you use a control")
+                detail = f" [{self.mpv.error}]" if self.mpv.error else ""
+                self.status("mpv was closed or the connection was lost - it restarts when you "
+                            "use a control" + detail)
                 self.now_label.setText("Idle")
                 self.set_play_button(False)
             return
@@ -1464,6 +1656,10 @@ class MainWindow(QMainWindow):
     # -- shutdown ------------------------------------------------------------------------------- #
     def closeEvent(self, event):
         self.timer.stop()
+        if self.watchdog:
+            faulthandler.cancel_dump_traceback_later()
+        for job in self.jobs:
+            job.stop.set()
         save_app_state({"eq_gains": self.eq_gains, "eq_enabled": self.eq_enabled,
                         "volume": self.volume, "last_dir": self.last_dir,
                         "window": self.saveGeometry().toBase64().data().decode("ascii")})
