@@ -33,7 +33,7 @@ tkinterdnd2               0.6.3
 ```sh
 .venv/bin/python mpv_playlist.py
 
-.venv/bin/pyinstaller mpv_playlist.py
+.venv/bin/pyinstaller --add-data="_internal/assets:assets" mpv_playlist.py
 ```
 
 ### Windows
@@ -42,6 +42,8 @@ tkinterdnd2               0.6.3
 python mpv_playlist.py
 
 pyinstaller --noconsole --icon=mpvl.ico --add-data="mpvl.ico;." mpv_playlist.py
+
+pyinstaller --noconsole --icon=mpvl.ico --add-data="_internal/assets;assets" mpv_playlist.py
 ```
 
 ## What it does
